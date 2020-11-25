@@ -2,13 +2,14 @@
 
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
+use tokio::io::unix::AsyncFd;
 use std::ptr::null_mut;
 use std::{io, mem, usize};
 
 // C types and constants.
 use libc::timeval as Timeval;
 use libc::{c_ulong, c_void, off_t, size_t};
-use libc::{MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE};
+use libc::{MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE, O_NONBLOCK};
 
 #[cfg(not(feature = "no_wrapper"))]
 mod ll {
@@ -57,7 +58,7 @@ macro_rules! check_io(
 
 pub fn open(file: &str) -> io::Result<RawFd> {
     let c_str = CString::new(file)?;
-    let fd = unsafe { ll::open(c_str.as_ptr(), O_RDWR, 0) };
+    let fd = unsafe { ll::open(c_str.as_ptr(), O_RDWR | O_NONBLOCK, 0) };
     check_io!(fd != -1);
     Ok(fd)
 }
@@ -67,27 +68,67 @@ pub fn close(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-pub fn xioctl<T>(fd: RawFd, request: usize, arg: &mut T) -> io::Result<()> {
+pub async fn xioctl<T>(fd: &AsyncFd<RawFd>, request: usize, arg: &mut T) -> io::Result<()> {
     let argp: *mut T = arg;
 
-    check_io!(unsafe {
-        let mut ok;
+    println!("waiting");
+    let mut ready = fd.writable().await.unwrap();
+    println!("ready");
 
-        loop {
-            ok = ll::ioctl(fd, request as c_ulong, argp as *mut c_void) != -1;
-            if ok || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                break;
+    ready.with_io(|| {
+        let io_ok = unsafe {
+            let mut ok;
+
+            loop {
+                ok = ll::ioctl(*fd.get_ref(), request as c_ulong, argp as *mut c_void) != -1;
+                if ok || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
             }
+
+            ok
+        };
+
+        if io_ok {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
-
-        ok
-    });
-
-    Ok(())
+    })
 }
 
-pub fn xioctl_valid<T>(fd: RawFd, request: usize, arg: &mut T) -> io::Result<bool> {
-    match xioctl(fd, request, arg) {
+pub async fn read_xioctl<T>(fd: &AsyncFd<RawFd>, request: usize, arg: &mut T) -> io::Result<()> {
+    let argp: *mut T = arg;
+
+    println!("waiting");
+    let mut ready = fd.readable().await.unwrap();
+    println!("ready");
+
+    ready.with_io(|| {
+        let io_ok = unsafe {
+            let mut ok;
+
+            loop {
+                ok = ll::ioctl(*fd.get_ref(), request as c_ulong, argp as *mut c_void) != -1;
+                if ok || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+
+            ok
+        };
+
+        if io_ok {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })
+}
+
+
+pub async fn xioctl_valid<T>(fd: &AsyncFd<RawFd>, request: usize, arg: &mut T) -> io::Result<bool> {
+    match xioctl(fd, request, arg).await {
         Ok(_) => Ok(true),
         Err(ref err) if err.kind() == io::ErrorKind::InvalidInput => Ok(false),
         Err(err) => Err(err),

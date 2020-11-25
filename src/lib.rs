@@ -32,6 +32,7 @@ use std::fmt;
 use std::io;
 use std::ops::Deref;
 use std::os::unix::io::RawFd;
+use tokio::io::unix::AsyncFd;
 use std::result;
 use std::slice;
 use std::str;
@@ -209,7 +210,7 @@ pub struct Frame {
 
     region: Arc<MappedRegion>,
     length: u32,
-    fd: RawFd,
+    fd: AsyncFd<RawFd>,
     buffer: v4l2::Buffer,
 }
 
@@ -232,7 +233,7 @@ impl Deref for Frame {
 
 impl Drop for Frame {
     fn drop(&mut self) {
-        let _ = v4l2::xioctl(self.fd, v4l2::VIDIOC_QBUF, &mut self.buffer);
+        let _ = v4l2::xioctl(&self.fd, v4l2::VIDIOC_QBUF, &mut self.buffer);
     }
 }
 
@@ -244,7 +245,7 @@ enum State {
 }
 
 pub struct Camera {
-    fd: RawFd,
+    fd: AsyncFd<RawFd>,
     state: State,
     resolution: (u32, u32),
     format: [u8; 4],
@@ -254,7 +255,7 @@ pub struct Camera {
 impl Camera {
     pub fn new(device: &str) -> io::Result<Camera> {
         Ok(Camera {
-            fd: v4l2::open(device)?,
+            fd: AsyncFd::new(v4l2::open(device)?)?,
             state: State::Idle,
             resolution: (0, 0),
             format: [0; 4],
@@ -271,11 +272,11 @@ impl Camera {
     }
 
     /// Get detailed info about the available resolutions.
-    pub fn resolutions(&self, format: [u8; 4]) -> Result<ResolutionInfo> {
+    pub async fn resolutions(&self, format: [u8; 4]) -> Result<ResolutionInfo> {
         let fourcc = FormatInfo::fourcc(format);
         let mut size = v4l2::Frmsizeenum::new(fourcc);
 
-        v4l2::xioctl_valid(self.fd, v4l2::VIDIOC_ENUM_FRAMESIZES, &mut size)?;
+        v4l2::xioctl_valid(&self.fd, v4l2::VIDIOC_ENUM_FRAMESIZES, &mut size).await?;
 
         if fourcc != size.pixelformat {
             return Err(Error::BadFormat);
@@ -285,7 +286,7 @@ impl Camera {
             let mut discretes = vec![(size.discrete().width, size.discrete().height)];
             size.index = 1;
 
-            while v4l2::xioctl_valid(self.fd, v4l2::VIDIOC_ENUM_FRAMESIZES, &mut size)? {
+            while v4l2::xioctl_valid(&self.fd, v4l2::VIDIOC_ENUM_FRAMESIZES, &mut size).await? {
                 {
                     let discrete = size.discrete();
                     discretes.push((discrete.width, discrete.height));
@@ -306,11 +307,11 @@ impl Camera {
     }
 
     /// Get detailed info about the available intervals.
-    pub fn intervals(&self, format: [u8; 4], resolution: (u32, u32)) -> Result<IntervalInfo> {
+    pub async fn intervals(&self, format: [u8; 4], resolution: (u32, u32)) -> Result<IntervalInfo> {
         let fourcc = FormatInfo::fourcc(format);
         let mut ival = v4l2::Frmivalenum::new(fourcc, resolution);
 
-        v4l2::xioctl_valid(self.fd, v4l2::VIDIOC_ENUM_FRAMEINTERVALS, &mut ival)?;
+        v4l2::xioctl_valid(&self.fd, v4l2::VIDIOC_ENUM_FRAMEINTERVALS, &mut ival).await?;
 
         if fourcc != ival.pixelformat {
             return Err(Error::BadFormat);
@@ -324,7 +325,7 @@ impl Camera {
             let mut discretes = vec![(ival.discrete().numerator, ival.discrete().denominator)];
             ival.index = 1;
 
-            while v4l2::xioctl_valid(self.fd, v4l2::VIDIOC_ENUM_FRAMEINTERVALS, &mut ival)? {
+            while v4l2::xioctl_valid(&self.fd, v4l2::VIDIOC_ENUM_FRAMEINTERVALS, &mut ival).await? {
                 {
                     let discrete = ival.discrete();
                     discretes.push((discrete.numerator, discrete.denominator));
@@ -363,35 +364,35 @@ impl Camera {
     }
 
     /// Get info about the control by id.
-    pub fn get_control(&self, id: u32) -> io::Result<Control> {
+    pub async fn get_control(&self, id: u32) -> io::Result<Control> {
         let mut qctrl = v4l2::QueryCtrl::new(id);
-        v4l2::xioctl(self.fd, v4l2::VIDIOC_QUERYCTRL, &mut qctrl)?;
+        v4l2::xioctl(&self.fd, v4l2::VIDIOC_QUERYCTRL, &mut qctrl).await?;
 
         let data = match qctrl.qtype {
             v4l2::CTRL_TYPE_INTEGER => CtrlData::Integer {
-                value: self.get_control_value(qctrl.id)?,
+                value: self.get_control_value(qctrl.id).await?,
                 default: qctrl.default_value,
                 minimum: qctrl.minimum,
                 maximum: qctrl.maximum,
                 step: qctrl.step,
             },
             v4l2::CTRL_TYPE_BOOLEAN => CtrlData::Boolean {
-                value: self.get_control_value(qctrl.id)? != 0,
+                value: self.get_control_value(qctrl.id).await? != 0,
                 default: qctrl.default_value != 0,
             },
             v4l2::CTRL_TYPE_MENU => CtrlData::Menu {
-                value: self.get_control_value(qctrl.id)? as u32,
+                value: self.get_control_value(qctrl.id).await? as u32,
                 default: qctrl.default_value as u32,
-                items: self.get_menu_items(qctrl.id, qctrl.minimum as u32, qctrl.maximum as u32)?,
+                items: self.get_menu_items(qctrl.id, qctrl.minimum as u32, qctrl.maximum as u32).await?,
             },
             v4l2::CTRL_TYPE_BUTTON => CtrlData::Button,
             v4l2::CTRL_TYPE_INTEGER64 => {
                 let mut qectrl = v4l2::QueryExtCtrl::new(qctrl.id);
 
-                v4l2::xioctl(self.fd, v4l2::VIDIOC_QUERY_EXT_CTRL, &mut qectrl)?;
+                v4l2::xioctl(&self.fd, v4l2::VIDIOC_QUERY_EXT_CTRL, &mut qectrl).await?;
 
                 CtrlData::Integer64 {
-                    value: self.get_ext_control_value(qctrl.id)?,
+                    value: self.get_ext_control_value(qctrl.id).await?,
                     default: qectrl.default_value,
                     minimum: qectrl.minimum,
                     maximum: qectrl.maximum,
@@ -400,24 +401,24 @@ impl Camera {
             }
             v4l2::CTRL_TYPE_CTRL_CLASS => CtrlData::CtrlClass,
             v4l2::CTRL_TYPE_STRING => CtrlData::String {
-                value: self.get_string_control(qctrl.id, qctrl.maximum as u32)?,
+                value: self.get_string_control(qctrl.id, qctrl.maximum as u32).await?,
                 minimum: qctrl.minimum as u32,
                 maximum: qctrl.maximum as u32,
                 step: qctrl.step as u32,
             },
             v4l2::CTRL_TYPE_BITMASK => CtrlData::Bitmask {
-                value: self.get_control_value(qctrl.id)? as u32,
+                value: self.get_control_value(qctrl.id).await? as u32,
                 default: qctrl.default_value as u32,
                 maximum: qctrl.maximum as u32,
             },
             v4l2::CTRL_TYPE_INTEGER_MENU => CtrlData::IntegerMenu {
-                value: self.get_control_value(qctrl.id)? as u32,
+                value: self.get_control_value(qctrl.id).await? as u32,
                 default: qctrl.default_value as u32,
                 items: self.get_int_menu_items(
                     qctrl.id,
                     qctrl.minimum as u32,
                     qctrl.maximum as u32,
-                )?,
+                ).await?,
             },
             _ => CtrlData::Unknown,
         };
@@ -430,29 +431,29 @@ impl Camera {
         })
     }
 
-    fn get_control_value(&self, id: u32) -> io::Result<i32> {
+    async fn get_control_value(&self, id: u32) -> io::Result<i32> {
         let mut ctrl = v4l2::Control::new(id);
-        v4l2::xioctl(self.fd, v4l2::VIDIOC_G_CTRL, &mut ctrl)?;
+        v4l2::xioctl(&self.fd, v4l2::VIDIOC_G_CTRL, &mut ctrl).await?;
         Ok(ctrl.value)
     }
 
-    fn get_ext_control_value(&self, id: u32) -> io::Result<i64> {
+    async fn get_ext_control_value(&self, id: u32) -> io::Result<i64> {
         let mut ctrl = v4l2::ExtControl::new(id, 0);
         {
             let mut ctrls = v4l2::ExtControls::new(id & v4l2::ID2CLASS, &mut ctrl);
-            v4l2::xioctl(self.fd, v4l2::VIDIOC_G_EXT_CTRLS, &mut ctrls)?;
+            v4l2::xioctl(&self.fd, v4l2::VIDIOC_G_EXT_CTRLS, &mut ctrls).await?;
         }
         Ok(ctrl.value)
     }
 
-    fn get_menu_items(&self, id: u32, min: u32, max: u32) -> io::Result<Vec<CtrlMenuItem>> {
+    async fn get_menu_items(&self, id: u32, min: u32, max: u32) -> io::Result<Vec<CtrlMenuItem>> {
         let mut items = vec![];
         let mut qmenu = v4l2::QueryMenu::new(id);
 
         for index in min..=max {
             qmenu.index = index as u32;
 
-            if v4l2::xioctl_valid(self.fd, v4l2::VIDIOC_QUERYMENU, &mut qmenu)? {
+            if v4l2::xioctl_valid(&self.fd, v4l2::VIDIOC_QUERYMENU, &mut qmenu).await? {
                 items.push(CtrlMenuItem {
                     index,
                     name: buffer_to_string(qmenu.data.name()),
@@ -463,14 +464,14 @@ impl Camera {
         Ok(items)
     }
 
-    fn get_int_menu_items(&self, id: u32, min: u32, max: u32) -> io::Result<Vec<CtrlIntMenuItem>> {
+    async fn get_int_menu_items(&self, id: u32, min: u32, max: u32) -> io::Result<Vec<CtrlIntMenuItem>> {
         let mut items = vec![];
         let mut qmenu = v4l2::QueryMenu::new(id);
 
         for index in min..=max {
             qmenu.index = index as u32;
 
-            if v4l2::xioctl_valid(self.fd, v4l2::VIDIOC_QUERYMENU, &mut qmenu)? {
+            if v4l2::xioctl_valid(&self.fd, v4l2::VIDIOC_QUERYMENU, &mut qmenu).await? {
                 items.push(CtrlIntMenuItem {
                     index,
                     value: qmenu.data.value(),
@@ -481,22 +482,22 @@ impl Camera {
         Ok(items)
     }
 
-    fn get_string_control(&self, id: u32, size: u32) -> io::Result<String> {
+    async fn get_string_control(&self, id: u32, size: u32) -> io::Result<String> {
         let mut buffer = Vec::with_capacity(size as usize + 1);
         let mut ctrl = v4l2::ExtControl::new(id, size + 1);
         ctrl.value = buffer.as_mut_ptr() as i64;
         let mut ctrls = v4l2::ExtControls::new(id & v4l2::ID2CLASS, &mut ctrl);
-        v4l2::xioctl(self.fd, v4l2::VIDIOC_G_EXT_CTRLS, &mut ctrls)?;
+        v4l2::xioctl(&self.fd, v4l2::VIDIOC_G_EXT_CTRLS, &mut ctrls).await?;
         unsafe { buffer.set_len(size as usize + 1) };
         Ok(buffer_to_string(&buffer[..]))
     }
 
     /// Set value of the control.
-    pub fn set_control<T: Settable>(&self, id: u32, value: &T) -> io::Result<()> {
+    pub async fn set_control<T: Settable>(&self, id: u32, value: &T) -> io::Result<()> {
         let mut ctrl = v4l2::ExtControl::new(id, 0);
         ctrl.value = value.unify();
         let mut ctrls = v4l2::ExtControls::new(id & v4l2::ID2CLASS, &mut ctrl);
-        v4l2::xioctl(self.fd, v4l2::VIDIOC_S_EXT_CTRLS, &mut ctrls)?;
+        v4l2::xioctl(&self.fd, v4l2::VIDIOC_S_EXT_CTRLS, &mut ctrls).await?;
         Ok(())
     }
 
@@ -504,14 +505,14 @@ impl Camera {
     ///
     /// # Panics
     /// If recalled or called after `stop()`.
-    pub fn start(&mut self, config: &Config<'_>) -> Result<()> {
+    pub async fn start(&mut self, config: &Config<'_>) -> Result<()> {
         assert_eq!(self.state, State::Idle);
 
-        self.tune_format(config.resolution, *config.format, config.field)?;
-        self.tune_stream(config.interval)?;
-        self.alloc_buffers(config.nbuffers)?;
+        self.tune_format(config.resolution, *config.format, config.field).await?;
+        self.tune_stream(config.interval).await?;
+        self.alloc_buffers(config.nbuffers).await?;
 
-        if let Err(err) = self.streamon() {
+        if let Err(err) = self.streamon().await {
             self.free_buffers();
             return Err(Error::Io(err));
         }
@@ -534,12 +535,12 @@ impl Camera {
     ///
     /// # Panics
     /// If called w/o streaming.
-    pub fn capture(&self) -> io::Result<Frame> {
+    pub async fn capture(&self) -> io::Result<Frame> {
         assert_eq!(self.state, State::Streaming);
 
         let mut buf = v4l2::Buffer::new();
 
-        v4l2::xioctl(self.fd, v4l2::VIDIOC_DQBUF, &mut buf)?;
+        v4l2::xioctl(&self.fd, v4l2::VIDIOC_DQBUF, &mut buf).await.expect("this xioctl");
         assert!(buf.index < self.buffers.len() as u32);
 
         Ok(Frame {
@@ -547,7 +548,7 @@ impl Camera {
             format: self.format,
             region: self.buffers[buf.index as usize].clone(),
             length: buf.bytesused,
-            fd: self.fd,
+            fd: AsyncFd::new(*self.fd.get_ref()).unwrap(),
             buffer: buf,
         })
     }
@@ -556,10 +557,10 @@ impl Camera {
     ///
     /// # Panics
     /// If called w/o streaming.
-    pub fn stop(&mut self) -> io::Result<()> {
+    pub async fn stop(&mut self) -> io::Result<()> {
         assert_eq!(self.state, State::Streaming);
 
-        self.streamoff()?;
+        self.streamoff().await?;
         self.free_buffers();
 
         self.state = State::Aborted;
@@ -567,11 +568,11 @@ impl Camera {
         Ok(())
     }
 
-    fn tune_format(&self, resolution: (u32, u32), format: [u8; 4], field: u32) -> Result<()> {
+    async fn tune_format(&self, resolution: (u32, u32), format: [u8; 4], field: u32) -> Result<()> {
         let fourcc = FormatInfo::fourcc(format);
         let mut fmt = v4l2::Format::new(resolution, fourcc, field as u32);
 
-        v4l2::xioctl(self.fd, v4l2::VIDIOC_S_FMT, &mut fmt)?;
+        v4l2::xioctl(&self.fd, v4l2::VIDIOC_S_FMT, &mut fmt).await?;
 
         if resolution != (fmt.fmt.width, fmt.fmt.height) {
             return Err(Error::BadResolution);
@@ -588,10 +589,10 @@ impl Camera {
         Ok(())
     }
 
-    fn tune_stream(&self, interval: (u32, u32)) -> Result<()> {
+    async fn tune_stream(&self, interval: (u32, u32)) -> Result<()> {
         let mut parm = v4l2::StreamParm::new(interval);
 
-        v4l2::xioctl(self.fd, v4l2::VIDIOC_S_PARM, &mut parm)?;
+        v4l2::xioctl(&self.fd, v4l2::VIDIOC_S_PARM, &mut parm).await?;
         let time = parm.parm.timeperframe;
 
         match (time.numerator * interval.1, time.denominator * interval.0) {
@@ -601,17 +602,17 @@ impl Camera {
         }
     }
 
-    fn alloc_buffers(&mut self, nbuffers: u32) -> Result<()> {
+    async fn alloc_buffers(&mut self, nbuffers: u32) -> Result<()> {
         let mut req = v4l2::RequestBuffers::new(nbuffers);
 
-        v4l2::xioctl(self.fd, v4l2::VIDIOC_REQBUFS, &mut req)?;
+        v4l2::xioctl(&self.fd, v4l2::VIDIOC_REQBUFS, &mut req).await?;
 
         for i in 0..nbuffers {
             let mut buf = v4l2::Buffer::new();
             buf.index = i;
-            v4l2::xioctl(self.fd, v4l2::VIDIOC_QUERYBUF, &mut buf)?;
+            v4l2::xioctl(&self.fd, v4l2::VIDIOC_QUERYBUF, &mut buf).await?;
 
-            let region = v4l2::mmap(buf.length as usize, self.fd, buf.m)?;
+            let region = v4l2::mmap(buf.length as usize, *self.fd.get_ref(), buf.m)?;
             self.buffers.push(Arc::new(region));
         }
 
@@ -622,23 +623,23 @@ impl Camera {
         self.buffers.clear();
     }
 
-    fn streamon(&self) -> io::Result<()> {
+    async fn streamon(&self) -> io::Result<()> {
         for i in 0..self.buffers.len() {
             let mut buf = v4l2::Buffer::new();
             buf.index = i as u32;
 
-            v4l2::xioctl(self.fd, v4l2::VIDIOC_QBUF, &mut buf)?;
+            v4l2::xioctl(&self.fd, v4l2::VIDIOC_QBUF, &mut buf).await?;
         }
 
         let mut typ = v4l2::BUF_TYPE_VIDEO_CAPTURE;
-        v4l2::xioctl(self.fd, v4l2::VIDIOC_STREAMON, &mut typ)?;
+        v4l2::xioctl(&self.fd, v4l2::VIDIOC_STREAMON, &mut typ).await?;
 
         Ok(())
     }
 
-    fn streamoff(&mut self) -> io::Result<()> {
+    async fn streamoff(&mut self) -> io::Result<()> {
         let mut typ = v4l2::BUF_TYPE_VIDEO_CAPTURE;
-        v4l2::xioctl(self.fd, v4l2::VIDIOC_STREAMOFF, &mut typ)?;
+        v4l2::xioctl(&self.fd, v4l2::VIDIOC_STREAMOFF, &mut typ).await?;
 
         Ok(())
     }
@@ -650,7 +651,7 @@ impl Drop for Camera {
             let _ = self.stop();
         }
 
-        let _ = v4l2::close(self.fd);
+        let _ = v4l2::close(*self.fd.get_ref());
     }
 }
 
@@ -659,27 +660,27 @@ pub struct FormatIter<'a> {
     index: u32,
 }
 
-impl<'a> Iterator for FormatIter<'a> {
-    type Item = io::Result<FormatInfo>;
-
-    fn next(&mut self) -> Option<io::Result<FormatInfo>> {
-        let mut fmt = v4l2::FmtDesc::new();
-        fmt.index = self.index;
-
-        match v4l2::xioctl_valid(self.camera.fd, v4l2::VIDIOC_ENUM_FMT, &mut fmt) {
-            Ok(true) => {
-                self.index += 1;
-                Some(Ok(FormatInfo::new(
-                    fmt.pixelformat,
-                    &fmt.description,
-                    fmt.flags,
-                )))
-            }
-            Ok(false) => None,
-            Err(err) => Some(Err(err)),
-        }
-    }
-}
+// impl<'a> Iterator for FormatIter<'a> {
+//     type Item = io::Result<FormatInfo>;
+//
+//     fn next(&mut self) -> Option<io::Result<FormatInfo>> {
+//         let mut fmt = v4l2::FmtDesc::new();
+//         fmt.index = self.index;
+//
+//         match v4l2::xioctl_valid(&self.camera.fd, v4l2::VIDIOC_ENUM_FMT, &mut fmt).await {
+//             Ok(true) => {
+//                 self.index += 1;
+//                 Some(Ok(FormatInfo::new(
+//                     fmt.pixelformat,
+//                     &fmt.description,
+//                     fmt.flags,
+//                 )))
+//             }
+//             Ok(false) => None,
+//             Err(err) => Some(Err(err)),
+//         }
+//     }
+// }
 
 pub struct ControlIter<'a> {
     camera: &'a Camera,
@@ -687,21 +688,21 @@ pub struct ControlIter<'a> {
     class: u32,
 }
 
-impl<'a> Iterator for ControlIter<'a> {
-    type Item = io::Result<Control>;
-
-    fn next(&mut self) -> Option<io::Result<Control>> {
-        match self.camera.get_control(self.id | v4l2::NEXT_CTRL) {
-            Ok(ref ctrl) if self.class > 0 && ctrl.id & v4l2::ID2CLASS != self.class as u32 => None,
-            Err(ref err) if err.kind() == io::ErrorKind::InvalidInput => None,
-            Ok(ctrl) => {
-                self.id = ctrl.id;
-                Some(Ok(ctrl))
-            }
-            err @ Err(_) => Some(err),
-        }
-    }
-}
+// impl<'a> Iterator for ControlIter<'a> {
+//     type Item = io::Result<Control>;
+//
+//     fn next(&mut self) -> Option<io::Result<Control>> {
+//         match self.camera.get_control(self.id | v4l2::NEXT_CTRL).await {
+//             Ok(ref ctrl) if self.class > 0 && ctrl.id & v4l2::ID2CLASS != self.class as u32 => None,
+//             Err(ref err) if err.kind() == io::ErrorKind::InvalidInput => None,
+//             Ok(ctrl) => {
+//                 self.id = ctrl.id;
+//                 Some(Ok(ctrl))
+//             }
+//             err @ Err(_) => Some(err),
+//         }
+//     }
+// }
 
 pub trait Settable {
     fn unify(&self) -> i64;
